@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -7,11 +7,19 @@ import {
   TouchableOpacity,
   SafeAreaView,
   FlatList,
+  Animated,
+  Share,
+  Platform,
+  ActivityIndicator,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter, Stack } from "expo-router";
+import { captureRef } from "react-native-view-shot";
 import { COLORS } from "../../../src/constants/colors";
-import { BatchPayoutItem, BatchPayoutSummary } from "../../../src/types/batchPayout";
+import {
+  BatchPayoutItem,
+  BatchPayoutSummary,
+} from "../../../src/types/batchPayout";
 
 type BatchStep = "pending" | "parsing" | "initiating" | "completed";
 
@@ -153,7 +161,23 @@ function StepIndicator({ currentStep }: { currentStep: BatchStep }) {
   );
 }
 
-function ProgressBar({
+/**
+ * AnimatedProgressBar
+ *
+ * #701 — Batch Payout Progress Bar
+ *
+ * Animates the progress fill width smoothly using React Native's built-in
+ * `Animated` API (the project's existing animation approach — no reanimated).
+ *
+ * The bar is driven by a 0–100 `progress` value derived from
+ * `completedCount / itemCount` on the batch execution state.
+ *
+ * States handled:
+ *  - initial (0 %): bar starts empty, no animation until first update
+ *  - partial (0 < n < 100): fill animates to the new width on each update
+ *  - completed (100 %): bar snaps to full width with a slightly faster spring
+ */
+function AnimatedProgressBar({
   progress,
   label,
 }: {
@@ -161,14 +185,62 @@ function ProgressBar({
   label: string;
 }) {
   const pct = Math.min(100, Math.max(0, progress));
+  const isComplete = pct >= 100;
+
+  // Animated value in the 0–100 range so we can interpolate to "X%".
+  const animatedPct = useRef(new Animated.Value(0)).current;
+
+  // Track layout width of the track so we can drive the fill in pixels, which
+  // Animated supports natively without needing reanimated.
+  const [trackWidth, setTrackWidth] = useState<number>(0);
+
+  useEffect(() => {
+    // Spring to the target percentage — smooth and snappy at completion.
+    Animated.spring(animatedPct, {
+      toValue: pct,
+      useNativeDriver: false, // layout animations require JS-driven updates
+      speed: isComplete ? 20 : 12,
+      bounciness: isComplete ? 2 : 4,
+    }).start();
+  }, [pct, isComplete, animatedPct]);
+
+  // Interpolate from the 0-100 animated value to pixel width.
+  const fillWidth =
+    trackWidth > 0
+      ? animatedPct.interpolate({
+          inputRange: [0, 100],
+          outputRange: [0, trackWidth],
+          extrapolate: "clamp",
+        })
+      : undefined;
+
+  // Fill colour transitions from primary to secondary green at completion.
+  const fillColor = animatedPct.interpolate({
+    inputRange: [0, 99, 100],
+    outputRange: [COLORS.primary, COLORS.primary, COLORS.secondary],
+    extrapolate: "clamp",
+  });
+
   return (
     <View style={styles.progressContainer}>
       <View style={styles.progressHeader}>
         <Text style={styles.progressLabel}>{label}</Text>
         <Text style={styles.progressText}>{pct.toFixed(0)}%</Text>
       </View>
-      <View style={styles.progressTrack}>
-        <View style={[styles.progressFill, { width: `${pct}%` }]} />
+      <View
+        style={styles.progressTrack}
+        onLayout={(e) => setTrackWidth(e.nativeEvent.layout.width)}
+      >
+        <Animated.View
+          style={[
+            styles.progressFill,
+            fillWidth !== undefined
+              ? { width: fillWidth, backgroundColor: fillColor }
+              : { width: `${pct}%` as unknown as number },
+          ]}
+          accessibilityRole="progressbar"
+          accessibilityValue={{ min: 0, max: 100, now: Math.round(pct) }}
+        />
       </View>
     </View>
   );
@@ -180,7 +252,10 @@ function StatusBadge({ status }: { status: BatchPayoutItem["status"] }) {
     pending: "#F59E0B",
     failed: "#EF4444",
   };
-  const iconMap: Record<BatchPayoutItem["status"], keyof typeof Ionicons.glyphMap> = {
+  const iconMap: Record<
+    BatchPayoutItem["status"],
+    keyof typeof Ionicons.glyphMap
+  > = {
     completed: "checkmark-circle",
     pending: "time",
     failed: "close-circle",
@@ -188,10 +263,7 @@ function StatusBadge({ status }: { status: BatchPayoutItem["status"] }) {
 
   return (
     <View
-      style={[
-        styles.statusBadge,
-        { backgroundColor: colorMap[status] + "18" },
-      ]}
+      style={[styles.statusBadge, { backgroundColor: colorMap[status] + "18" }]}
     >
       <Ionicons name={iconMap[status]} size={14} color={colorMap[status]} />
       <Text style={[styles.statusText, { color: colorMap[status] }]}>
@@ -227,7 +299,12 @@ export default function BatchDetailScreen() {
   const router = useRouter();
   const [summary] = useState<BatchPayoutSummary>(MOCK_SUMMARY);
   const [items] = useState<BatchPayoutItem[]>(MOCK_ITEMS);
-  const [filter, setFilter] = useState<"all" | "completed" | "pending" | "failed">("all");
+  const [filter, setFilter] = useState<
+    "all" | "completed" | "pending" | "failed"
+  >("all");
+  const [exporting, setExporting] = useState(false);
+
+  const receiptRef = useRef<View>(null);
 
   const currentStep: BatchStep = useMemo(() => {
     if (summary.failedCount > 0) return "completed";
@@ -238,22 +315,62 @@ export default function BatchDetailScreen() {
   }, [summary]);
 
   const progress = useMemo(
-    () => (summary.itemCount > 0 ? (summary.completedCount / summary.itemCount) * 100 : 0),
-    [summary],
+    () =>
+      summary.itemCount > 0
+        ? (summary.completedCount / summary.itemCount) * 100
+        : 0,
+    [summary]
   );
 
   const filteredItems = useMemo(
     () => (filter === "all" ? items : items.filter((i) => i.status === filter)),
-    [items, filter],
+    [items, filter]
   );
 
   const successRate = useMemo(
     () =>
       summary.itemCount > 0
-        ? ((summary.completedCount / (summary.itemCount - summary.failedCount)) * 100).toFixed(1)
+        ? (
+            (summary.completedCount /
+              (summary.itemCount - summary.failedCount)) *
+            100
+          ).toFixed(1)
         : "0",
-    [summary],
+    [summary]
   );
+
+  /**
+   * #694 — Transaction receipt export
+   *
+   * Captures the hidden receipt container via react-native-view-shot and
+   * hands the resulting PNG over to the system share sheet. Works for both
+   * completed batches and (once wired to real data) P2P transfers.
+   */
+  const handleExportReceipt = async () => {
+    if (!receiptRef.current) return;
+    try {
+      setExporting(true);
+      const uri = await captureRef(receiptRef, {
+        format: "png",
+        quality: 1,
+        result: "tmpfile",
+        width: 680,
+      });
+      await Share.share({
+        url: Platform.OS === "ios" ? uri : `file://${uri}`,
+        message: `ZAPS batch receipt #${summary.id}`,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not export receipt";
+      (
+        globalThis as unknown as {
+          toast?: { error: (message: string) => void };
+        }
+      ).toast?.error(msg);
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const filters = [
     { key: "all" as const, label: "All" },
@@ -271,7 +388,22 @@ export default function BatchDetailScreen() {
           <Ionicons name="arrow-back" size={24} color={COLORS.black} />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Batch Details</Text>
-        <View style={styles.headerSpacer} />
+        <TouchableOpacity
+          onPress={handleExportReceipt}
+          disabled={exporting}
+          style={styles.exportBtn}
+          accessibilityLabel="Export receipt"
+        >
+          {exporting ? (
+            <ActivityIndicator
+              testID="export-spinner"
+              size="small"
+              color={COLORS.primary}
+            />
+          ) : (
+            <Ionicons name="share-outline" size={22} color={COLORS.primary} />
+          )}
+        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -289,7 +421,7 @@ export default function BatchDetailScreen() {
         <View style={styles.stepperCard}>
           <Text style={styles.sectionTitle}>Execution Progress</Text>
           <StepIndicator currentStep={currentStep} />
-          <ProgressBar progress={progress} label="Overall Progress" />
+          <AnimatedProgressBar progress={progress} label="Overall Progress" />
         </View>
 
         <View style={styles.statsCard}>
@@ -348,6 +480,69 @@ export default function BatchDetailScreen() {
           ))}
         </View>
       </ScrollView>
+
+      {/* Hidden receipt container — captured via react-native-view-shot (#694).
+          Rendered off-screen so it never flashes on device but stays capturable. */}
+      <View
+        ref={receiptRef}
+        collapsable={false}
+        pointerEvents="none"
+        style={styles.hiddenReceipt}
+      >
+        <View style={styles.receiptCard}>
+          <View style={styles.receiptHeader}>
+            <Text style={styles.receiptBrand}>ZAPS</Text>
+            <Text style={styles.receiptTitle}>Batch Receipt</Text>
+          </View>
+
+          <View style={styles.receiptDivider} />
+
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Batch ID</Text>
+            <Text style={styles.receiptValue}>#{summary.id}</Text>
+          </View>
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Issued</Text>
+            <Text style={styles.receiptValue}>
+              {new Date(summary.createdAt).toLocaleString()}
+            </Text>
+          </View>
+
+          <View style={styles.receiptDivider} />
+
+          <View style={styles.receiptTotalRow}>
+            <Text style={styles.receiptTotalLabel}>Total Payout</Text>
+            <Text style={styles.receiptTotalValue}>
+              {summary.totalAmount} {summary.currency}
+            </Text>
+          </View>
+
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Recipients</Text>
+            <Text style={styles.receiptValue}>{summary.itemCount}</Text>
+          </View>
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Completed</Text>
+            <Text style={[styles.receiptValue, { color: "#22C55E" }]}>
+              {summary.completedCount}
+            </Text>
+          </View>
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Failed</Text>
+            <Text style={[styles.receiptValue, { color: "#EF4444" }]}>
+              {summary.failedCount}
+            </Text>
+          </View>
+          <View style={styles.receiptRow}>
+            <Text style={styles.receiptLabel}>Success Rate</Text>
+            <Text style={styles.receiptValue}>{successRate}%</Text>
+          </View>
+
+          <View style={styles.receiptDivider} />
+
+          <Text style={styles.receiptFooter}>Generated by ZAPS mobile app</Text>
+        </View>
+      </View>
     </SafeAreaView>
   );
 }
@@ -373,7 +568,6 @@ const styles = StyleSheet.create({
     fontFamily: "Outfit_700Bold",
     color: COLORS.black,
   },
-  headerSpacer: { width: 40 },
   scrollContent: {
     paddingHorizontal: 20,
     paddingBottom: 40,
@@ -565,4 +759,83 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   statusText: { fontSize: 11, fontFamily: "Outfit_600SemiBold" },
+  exportBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  // Off-screen but rendered (and collapsable=false) so captureRef can snapshot it.
+  hiddenReceipt: {
+    position: "absolute",
+    left: -9999,
+    top: 0,
+    width: 340,
+    backgroundColor: COLORS.white,
+    padding: 24,
+  },
+  receiptCard: {
+    backgroundColor: COLORS.white,
+    borderRadius: 24,
+    padding: 24,
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+  },
+  receiptHeader: {
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  receiptBrand: {
+    fontSize: 30,
+    fontFamily: "Outfit_700Bold",
+    color: COLORS.primary,
+  },
+  receiptTitle: {
+    fontSize: 13,
+    fontFamily: "Outfit_500Medium",
+    color: "#999",
+    marginTop: 2,
+  },
+  receiptDivider: {
+    height: 1,
+    backgroundColor: "#E8E8E8",
+    marginVertical: 14,
+  },
+  receiptRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 5,
+  },
+  receiptLabel: {
+    fontSize: 13,
+    fontFamily: "Outfit_400Regular",
+    color: "#666",
+  },
+  receiptValue: {
+    fontSize: 13,
+    fontFamily: "Outfit_600SemiBold",
+    color: COLORS.black,
+  },
+  receiptTotalRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+  },
+  receiptTotalLabel: {
+    fontSize: 14,
+    fontFamily: "Outfit_600SemiBold",
+    color: COLORS.black,
+  },
+  receiptTotalValue: {
+    fontSize: 20,
+    fontFamily: "Outfit_700Bold",
+    color: COLORS.primary,
+  },
+  receiptFooter: {
+    fontSize: 11,
+    fontFamily: "Outfit_400Regular",
+    color: "#bbb",
+    textAlign: "center",
+  },
 });

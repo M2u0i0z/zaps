@@ -12,10 +12,20 @@
  *    by the `apiFetch` wrapper.
  *  - A 401 response automatically clears the cached session and invokes the
  *    optional `onSessionExpired` callback so the app can redirect to login.
+ *
+ * #687 — Offline Transaction Queue & Sync Engine
+ *  - `sendTransactionWithOfflineSupport` wraps any outgoing Zap transaction
+ *    request: if the device is offline (NetInfo) or the request fails with a
+ *    network error, the payload is enqueued via `offlineQueue.enqueueTransaction`
+ *    for automatic replay upon reconnection.
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
+import NetInfo from "@react-native-community/netinfo";
+import { enqueueTransaction, startOfflineQueueSync } from "./offlineQueue";
+import { fetchTransactions } from "./transactionService";
+import type { Transaction } from "../types/transaction";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -117,7 +127,7 @@ export function registerSessionExpiredHandler(handler: () => void): void {
  * - On a 401 response, clears the stored session and fires the expiry handler
  *   so the app can redirect to login.
  */
-async function apiFetch(
+export async function apiFetch(
   input: string,
   init?: RequestInit
 ): Promise<Response> {
@@ -196,6 +206,40 @@ export async function updateAutoEarn(enabled: boolean): Promise<void> {
   }
 }
 
+export interface YieldTransactionQuery {
+  /** Asset code filter, e.g. "XLM" | "USDC" | "USDT". */
+  asset?: string;
+  /** ISO date (YYYY-MM-DD) — earliest transaction to include. */
+  dateFrom?: string;
+  /** ISO date (YYYY-MM-DD) — latest transaction to include. */
+  dateTo?: string;
+}
+
+/**
+ * #692 — Yield transaction history.
+ *
+ * Fetches the user's yield transactions (interest/reward/APY) filtered by the
+ * selected date range and asset type. Delegates to the transaction service so
+ * the client-side filters and backend query params stay in lockstep.
+ */
+export async function getYieldTransactions(
+  query: YieldTransactionQuery = {}
+): Promise<Transaction[]> {
+  const page = await fetchTransactions(
+    {
+      type: "yield",
+      status: "all",
+      search: "",
+      yieldOnly: true,
+      asset: query.asset,
+      dateFrom: query.dateFrom,
+      dateTo: query.dateTo,
+    },
+    null
+  );
+  return page.items;
+}
+
 // ── Username Resolution ──────────────────────────────────────────────────────
 
 export interface ReceiverDetails {
@@ -212,14 +256,18 @@ export interface UsernameLookupError extends Error {
  * Resolves a username to its registered Stellar address for transaction flows.
  * Uses the cached backend endpoint that checks Redis before falling back to Postgres.
  * Automatically saves successful lookups to recent recipients.
- * 
+ *
  * @param username - The username to resolve (must be 3-15 chars, lowercase alphanumeric)
  * @returns Promise resolving to receiver details with username and address
  * @throws UsernameLookupError with specific error codes for different failure scenarios
  */
-export async function resolveUsername(username: string): Promise<ReceiverDetails> {
+export async function resolveUsername(
+  username: string
+): Promise<ReceiverDetails> {
   if (!username || typeof username !== "string") {
-    const error = new Error("Username is required and must be a string") as UsernameLookupError;
+    const error = new Error(
+      "Username is required and must be a string"
+    ) as UsernameLookupError;
     error.code = "INVALID_USERNAME";
     throw error;
   }
@@ -232,15 +280,17 @@ export async function resolveUsername(username: string): Promise<ReceiverDetails
   }
 
   try {
-    const response = await apiFetch(`${API_BASE}/api/users/resolve/${encodeURIComponent(trimmedUsername)}`);
-    
+    const response = await apiFetch(
+      `${API_BASE}/api/users/resolve/${encodeURIComponent(trimmedUsername)}`
+    );
+
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       const error = new Error(
         errorData.error || `HTTP ${response.status}: ${response.statusText}`
       ) as UsernameLookupError;
       error.statusCode = response.status;
-      
+
       if (response.status === 404) {
         error.code = "NOT_FOUND";
       } else if (response.status === 400) {
@@ -248,15 +298,17 @@ export async function resolveUsername(username: string): Promise<ReceiverDetails
       } else {
         error.code = "NETWORK_ERROR";
       }
-      
+
       throw error;
     }
 
     const data = await response.json();
-    
+
     // Validate the response structure
     if (!data || typeof data !== "object" || !data.username || !data.address) {
-      const error = new Error("Invalid response format from server") as UsernameLookupError;
+      const error = new Error(
+        "Invalid response format from server"
+      ) as UsernameLookupError;
       error.code = "UNKNOWN_ERROR";
       throw error;
     }
@@ -280,7 +332,9 @@ export async function resolveUsername(username: string): Promise<ReceiverDetails
 
     // Handle network errors and other unexpected failures
     const error = new Error(
-      err instanceof Error ? err.message : "Unknown error occurred during username lookup"
+      err instanceof Error
+        ? err.message
+        : "Unknown error occurred during username lookup"
     ) as UsernameLookupError;
     error.code = "NETWORK_ERROR";
     throw error;
@@ -291,11 +345,13 @@ export async function resolveUsername(username: string): Promise<ReceiverDetails
  * Safely resolves a username with automatic error handling and user-friendly messages.
  * Returns null on any error instead of throwing, making it suitable for UI flows
  * where you want to handle errors gracefully.
- * 
+ *
  * @param username - The username to resolve
  * @returns Promise resolving to receiver details or null on any error
  */
-export async function safeResolveUsername(username: string): Promise<ReceiverDetails | null> {
+export async function safeResolveUsername(
+  username: string
+): Promise<ReceiverDetails | null> {
   try {
     return await resolveUsername(username);
   } catch (error) {
@@ -308,7 +364,7 @@ export async function safeResolveUsername(username: string): Promise<ReceiverDet
  * Batch resolve multiple usernames efficiently.
  * Note: Currently calls the single endpoint multiple times. Could be optimized
  * with a dedicated batch endpoint in the future.
- * 
+ *
  * @param usernames - Array of usernames to resolve
  * @returns Promise resolving to map of username -> ReceiverDetails (successful lookups only)
  */
@@ -320,7 +376,7 @@ export async function batchResolveUsernames(
   }
 
   const results: Record<string, ReceiverDetails> = {};
-  
+
   // Use Promise.allSettled to handle partial failures gracefully
   const promises = usernames.map(async (username) => {
     try {
@@ -332,7 +388,7 @@ export async function batchResolveUsernames(
   });
 
   const settled = await Promise.allSettled(promises);
-  
+
   settled.forEach((outcome) => {
     if (outcome.status === "fulfilled" && outcome.value.result) {
       results[outcome.value.username] = outcome.value.result;
@@ -345,7 +401,7 @@ export async function batchResolveUsernames(
 /**
  * Resolves a username and returns the result in ZapsUser format for compatibility
  * with existing UI components that expect the full user interface.
- * 
+ *
  * @param username - The username to resolve
  * @returns Promise resolving to a partial ZapsUser with username and address
  * @throws UsernameLookupError with specific error codes for different failure scenarios
@@ -362,5 +418,181 @@ export async function resolveUsernameAsZapsUser(username: string): Promise<{
     address: receiverDetails.address,
     avatar_url: null, // resolve endpoint doesn't include avatar
     isVerified: false, // placeholder as noted in ZapsUser interface
+  };
+}
+
+// ── #687 — Offline Transaction Queue Integration ──────────────────────────────
+
+export interface TransactionPayload {
+  endpoint: string;
+  method?: string;
+  body: Record<string, unknown>;
+}
+
+export interface OfflineSendResult {
+  /** true → request went through immediately; false → queued for later sync */
+  sent: boolean;
+  /** present when the request was sent and the server responded */
+  response?: Response;
+  /** present when the payload was enqueued rather than sent */
+  queued?: boolean;
+}
+
+/**
+ * Send a Zap transaction request with offline-queue fallback (#687).
+ *
+ * Checks device connectivity via NetInfo before attempting the request:
+ *  - **Online** → fires the request directly via `apiFetch`.  If the request
+ *    itself fails with a network error, falls back to queuing automatically.
+ *  - **Offline** → skips the network attempt entirely and enqueues the
+ *    payload in AsyncStorage so it is replayed on reconnection.
+ *
+ * In both cases the caller receives an `OfflineSendResult` that indicates
+ * whether the transaction was transmitted immediately or queued.
+ *
+ * @example
+ * const { sent, queued } = await sendTransactionWithOfflineSupport({
+ *   endpoint: `${API_BASE}/api/v1/transfer`,
+ *   method: "POST",
+ *   body: { recipient: "tolu.zaps", amount: "500", currency: "USDC" },
+ * });
+ *
+ * if (queued) {
+ *   showToast("You're offline. Your transaction will be sent when you reconnect.");
+ * }
+ */
+export async function sendTransactionWithOfflineSupport(
+  payload: TransactionPayload
+): Promise<OfflineSendResult> {
+  // Check current connectivity before attempting the request.
+  const networkState = await NetInfo.fetch();
+  const isConnected = networkState.isConnected === true;
+
+  if (!isConnected) {
+    // Offline path: persist for later sync.
+    const authToken = await getSessionToken();
+    await enqueueTransaction({
+      endpoint: payload.endpoint,
+      method: payload.method ?? "POST",
+      body: payload.body,
+      authToken: authToken ?? undefined,
+    });
+    return { sent: false, queued: true };
+  }
+
+  // Online path: attempt the request directly.
+  try {
+    const response = await apiFetch(payload.endpoint, {
+      method: payload.method ?? "POST",
+      body: JSON.stringify(payload.body),
+    });
+    return { sent: true, response };
+  } catch {
+    // Network error despite NetInfo reporting online (race condition or
+    // transient connectivity drop). Enqueue for later replay.
+    const authToken = await getSessionToken();
+    await enqueueTransaction({
+      endpoint: payload.endpoint,
+      method: payload.method ?? "POST",
+      body: payload.body,
+      authToken: authToken ?? undefined,
+    });
+    return { sent: false, queued: true };
+  }
+}
+
+/**
+ * Start the offline queue sync listener.
+ *
+ * Should be called once from the root layout so the queue is processed
+ * automatically whenever the device reconnects to the internet.
+ *
+ * @returns Cleanup function — call on unmount / logout.
+ *
+ * @example
+ * // In _layout.tsx:
+ * useEffect(() => {
+ *   const cleanup = initOfflineSync();
+ *   return cleanup;
+ * }, []);
+ */
+export function initOfflineSync(): () => void {
+  return startOfflineQueueSync();
+}
+
+// ── Privy Social Recovery ──────────────────────────────────────────────────────
+
+export interface PrivyRecoveryResult {
+  privy_did: string;
+  username: string;
+  address: string;
+  display_name?: string;
+}
+
+/**
+ * Verify a Privy token and exchange it for the linked user's wallet details.
+ *
+ * This is the entry point for Issue #706's social-auth recovery flow:
+ *   1. User completes Privy social login (handled by PrivySocialButtons).
+ *   2. Caller supplies the Privy JWT access token.
+ *   3. This helper verifies the token with the backend and resolves the
+ *      Privy DID to the registered Stellar wallet address.
+ *
+ * @param privyToken - The Privy access token obtained from the social auth flow.
+ * @returns The linked user's wallet details.
+ * @throws Error if the token is invalid or no wallet is linked.
+ */
+export async function recoverWalletViaPrivy(
+  privyToken: string
+): Promise<PrivyRecoveryResult> {
+  if (!privyToken) {
+    throw new Error("Privy token is required for social recovery.");
+  }
+
+  const res = await apiFetch(`${API_BASE}/api/auth/privy`, {
+    method: "POST",
+    body: JSON.stringify({
+      privy_token: privyToken,
+      privy_did: "",
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "Unknown error");
+    throw new Error(`Privy verification failed: ${text}`);
+  }
+
+  const data = await res.json();
+
+  if (!data?.privy_did) {
+    throw new Error("Privy identity could not be resolved.");
+  }
+
+  const didRes = await apiFetch(
+    `${API_BASE}/api/users/did/${encodeURIComponent(data.privy_did)}`
+  );
+
+  if (didRes.status === 404) {
+    throw new Error(
+      "No Zaps wallet is linked to this social identity. Please create an account first."
+    );
+  }
+
+  if (!didRes.ok) {
+    const text = await didRes.text().catch(() => "Unknown error");
+    throw new Error(`User lookup failed: ${text}`);
+  }
+
+  const user = await didRes.json();
+
+  if (!user?.address) {
+    throw new Error("Linked account has no wallet address.");
+  }
+
+  return {
+    privy_did: user.privy_did,
+    username: user.username,
+    address: user.address,
+    display_name: user.display_name,
   };
 }
